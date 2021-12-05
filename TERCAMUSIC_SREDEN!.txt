@@ -1,0 +1,615 @@
+/*
+  OpenOpener :
+  dual swing-gate automatic gate opener
+*/
+
+// pins definitions :
+// D0  - USB Rx
+// D1  - USB Tx
+// D2  - BP stop
+// D3  - Remote Control
+// D8  - Relay M1A
+// D9  - Relay M1B
+// D10  - Relay M2A
+// D11  - Relay M2B
+//
+// D8  - BP close
+// D9  - BP open
+// D10 - PWM M1
+// D11 - PWM M2
+// D12 - relay FlashLight
+// D13 -
+#include <Bounce2.h>
+#define PIN_PHOTO_STOP 2
+#define PIN_REMOTE 3
+#define OPEN_MASTER_GATE  8  // D2 relay board
+#define CLOSE_MASTER_GATE  9  // D3 relay board
+#define OPEN_SLAVE_GATE  10  // D0 relay board
+#define CLOSE_SLAVE_GATE  11  // D1 relay board
+#define PHOTOCELL_STOP  20 // pin 2 for external interrupt
+#define PHOTOCELL_OPEN  21
+#define PHOTOCELL_CLOSE 22
+
+
+
+
+// defines
+//#define _DEBUG_BP
+#undef _DEBUG_BP
+
+
+// MASTER TIMING
+//OTVARANJE
+unsigned long DELAY_OPEN = 3000;
+unsigned long TRAVELING_DELAY_MASTER = 18000;
+unsigned long TRAVELING_TIME_MASTER = 21000;
+
+//ZATVARANJE
+unsigned long TRAVELING_DELAY_SLAVE = 18000;
+unsigned long DELAY_CLOSE = 9000;
+unsigned long TRAVELING_TIME_SLAVE = 27000;
+
+
+
+// enum
+enum OpeningStates {
+  INIT_OPEN,
+  OPEN_M1,
+  OPEN_DELAY,
+  OPEN_M2,
+  OPEN_OPEN_DELAY,
+  WAIT_OPEN_END,
+  END_OPEN
+};
+
+enum ClosingStates {
+  INIT_CLOSE,
+  CLOSE_M1,
+  CLOSE_DELAY,
+  CLOSE_M2,
+  CLOSE_CLOSE_DELAY,
+  WAIT_CLOSE_END,
+  END_CLOSE
+};
+
+enum RemoteStates {
+  STATE_STOP1,  // 0
+  STATE_OPEN,   // 1
+  STATE_STOP2,  // 2
+  STATE_CLOSE,   // 3
+  STATE_STOP3,
+  STATE_STOP4,
+};
+
+// global variables
+unsigned char StopCount;
+unsigned char nextState;
+boolean bOpening;  // flag for opening gates
+boolean bClosing;  // flag for closing gates
+unsigned long timeStartOpenM1 = 0;
+unsigned long timeStartOpenM2 = 0;
+unsigned long timeStartCloseM2 = 0;
+unsigned long timeStartCloseM1 = 0;
+boolean bStopNow = false;
+unsigned char currentState = STATE_STOP1;  // remote control state machine
+unsigned char newState = STATE_STOP1;  // remote control state machine;
+unsigned long lastTimeCheck = 0;
+unsigned long timeCurrent = 0;  // check currents values from shunt resistors
+unsigned long buttonPressedOpen = 0;
+unsigned long buttonPressedClose = 0;
+unsigned long CalculateOpen = 0;
+unsigned long CalculateClose = 0;
+bool isM1Stopped = false;
+bool isM2Stopped = false;
+
+// Instantiate a Bounce object
+Bounce debouncer1 = Bounce();
+Bounce debouncer2 = Bounce();
+
+// setup:
+void setup() {
+  // init globals
+  StopCount = 0;
+  nextState = 0;
+  bOpening = false;
+  bClosing = false;
+
+  // output pins:
+  pinMode(CLOSE_MASTER_GATE, OUTPUT); digitalWrite(CLOSE_MASTER_GATE, HIGH);
+  pinMode(OPEN_MASTER_GATE, OUTPUT); digitalWrite(OPEN_MASTER_GATE, HIGH);
+  pinMode(CLOSE_SLAVE_GATE, OUTPUT); digitalWrite(CLOSE_SLAVE_GATE, HIGH);
+  pinMode(OPEN_SLAVE_GATE, OUTPUT); digitalWrite(OPEN_SLAVE_GATE, HIGH);
+
+
+  // input pins:
+  pinMode(PHOTOCELL_OPEN, OUTPUT); digitalWrite(PHOTOCELL_OPEN, LOW);
+  pinMode(PHOTOCELL_CLOSE, OUTPUT); digitalWrite(PHOTOCELL_CLOSE, LOW);
+  pinMode(PHOTOCELL_STOP, OUTPUT); digitalWrite(PHOTOCELL_STOP, LOW);
+  pinMode(PIN_REMOTE, INPUT);
+  debouncer1.attach(PIN_REMOTE);
+  debouncer1.interval(300); // interval in ms
+  pinMode(PIN_PHOTO_STOP, INPUT);
+  debouncer2.attach(PIN_PHOTO_STOP);
+  debouncer2.interval(200); // interval in ms
+  // Serial link
+  Serial.begin(9600);
+  Serial.println("OpenOpener");
+
+  // interrupt pin for "remote control" input pin
+  //attachInterrupt(1, RemoteEvent, RISING);
+
+  StopGates();
+}
+
+// loop:
+void loop() {
+  //read remote && photo sensor
+  debouncer1.update();
+  debouncer2.update();
+  if ( debouncer1.fell() ) {  // Call code if button transitions from HIGH to LOW
+    RemoteEvent(); // Apply new LED state
+  }
+  if ( debouncer2.fell() ) {  // Call code if button transitions from HIGH to LOW
+    Photo_Stop_Event(); // Apply new LED state
+  }
+
+  // read buttons:
+  boolean bStop =  digitalRead(PHOTOCELL_STOP);
+  boolean bOpen =  digitalRead(PHOTOCELL_OPEN);
+  boolean bClose =  digitalRead(PHOTOCELL_CLOSE);
+
+#ifdef _DEBUG_BP
+  // debug:
+  unsigned long static waitalittle;
+  if (millis() - waitalittle > 500) {
+    waitalittle = millis();
+    Serial.print("bStopNow:"); Serial.print(bStopNow); Serial.print("; bOpening:"); Serial.print(bOpening); Serial.print("; bClosing:"); Serial.println(bClosing);
+  }
+#endif // _DEBUG_DP  
+
+  // TODO: debounce buttons
+
+  // remote control read:
+  if (newState != currentState) { // remote control detection
+    switch (newState) {
+      case STATE_STOP1:
+        Serial.print("STATE_STOP1: ");
+        bStop = true;
+        bStopNow = true;
+        TRAVELING_DELAY_SLAVE = 18000; // RESET TIMER ZATVARANJE
+        DELAY_CLOSE = 9000;////////////// RESET TIMER ZATVARANJE
+        TRAVELING_TIME_SLAVE = 27000;//// RESET TIMER ZATVARANJE
+        Serial.print("DELAY_OPEN: "); Serial.println(DELAY_OPEN); Serial.println("");
+        Serial.print("TRAVELING_DELAY_MASTER "); Serial.println(TRAVELING_DELAY_MASTER); Serial.println("");
+        Serial.print("TRAVELING_TIME_MASTER: "); Serial.println(TRAVELING_TIME_MASTER); Serial.println("");
+        break;
+
+      case STATE_STOP2:
+        Serial.print("STATE_STOP2: ");
+        bStop = true;
+        bStopNow = true;
+        DELAY_OPEN = 3000; /////////////// RESET TIMER OTVARANJE
+        TRAVELING_DELAY_MASTER = 18000; // RESET TIMER OTVARANJE
+        TRAVELING_TIME_MASTER = 21000; /// RESET TIMER OTVARANJE
+        Serial.print("DELAY_CLOSE: "); Serial.println(DELAY_CLOSE); Serial.println("");
+        Serial.print("TRAVELING_DELAY_SLAVE: "); Serial.println(TRAVELING_DELAY_SLAVE); Serial.println("");
+        Serial.print("TRAVELING_TIME_SLAVE: "); Serial.println(TRAVELING_TIME_SLAVE); Serial.println("");
+        break;
+
+      case STATE_STOP3:
+        Serial.print("STATE_STOP3: ");
+        CalculateOpen =  buttonPressedOpen - timeStartOpenM1;
+        if (CalculateOpen > DELAY_OPEN) {
+          DELAY_OPEN = 0;
+        }
+        else {
+          DELAY_OPEN = DELAY_OPEN - CalculateOpen;
+        }
+
+        if (CalculateOpen > TRAVELING_DELAY_MASTER) {
+          TRAVELING_DELAY_MASTER = 0;
+        }
+        else {
+          TRAVELING_DELAY_MASTER = TRAVELING_DELAY_MASTER - CalculateOpen;
+        }
+
+        if (CalculateOpen > TRAVELING_TIME_MASTER) {
+          TRAVELING_TIME_MASTER = 0;
+        }
+        else {
+          TRAVELING_TIME_MASTER = TRAVELING_TIME_MASTER - CalculateOpen;
+        }
+        //Serial.print("CalculateOpen: "); Serial.println(CalculateOpen); Serial.println("");
+        Serial.print("DELAY_OPEN: "); Serial.println(DELAY_OPEN); Serial.println("");
+        Serial.print("TRAVELING_DELAY_MASTER: "); Serial.println(TRAVELING_DELAY_MASTER); Serial.println("");
+        Serial.print("TRAVELING_TIME_MASTER: "); Serial.println(TRAVELING_TIME_MASTER); Serial.println("");
+        bStop = true;
+        bStopNow = true;
+        break;
+
+      case STATE_STOP4:
+        Serial.print("STATE_STOP4: ");
+        CalculateClose =  buttonPressedClose - timeStartCloseM2;
+        if (CalculateClose > DELAY_CLOSE) {
+          DELAY_CLOSE = 0;
+        }
+        else {
+          DELAY_CLOSE = DELAY_CLOSE - CalculateClose;
+        }
+        if (CalculateClose > TRAVELING_DELAY_SLAVE) {
+          TRAVELING_DELAY_SLAVE = 0;
+        }
+        else {
+          TRAVELING_DELAY_SLAVE = TRAVELING_DELAY_SLAVE - CalculateClose;
+        }
+        if (CalculateClose > TRAVELING_TIME_SLAVE) {
+          TRAVELING_TIME_SLAVE = 0;
+        }
+        else {
+          TRAVELING_TIME_SLAVE = TRAVELING_TIME_SLAVE - CalculateClose;
+        }
+        //Serial.print("CalculateClose: "); Serial.println(CalculateClose); Serial.println("");
+        Serial.print("DELAY_CLOSE: "); Serial.println(DELAY_CLOSE); Serial.println("");
+        Serial.print("TRAVELING_DELAY_SLAVE: "); Serial.println(TRAVELING_DELAY_SLAVE); Serial.println("");
+        Serial.print("TRAVELING_TIME_SLAVE: "); Serial.println(TRAVELING_TIME_SLAVE); Serial.println("");
+        bStop = true;
+        bStopNow = true;
+        break;
+
+      case STATE_OPEN:
+        bOpening = true;
+        nextState = INIT_OPEN;
+        break;
+      case STATE_CLOSE:
+        bClosing = true;
+        nextState = INIT_CLOSE;
+
+        break;
+      default: bStopNow = true;
+    }
+    currentState = newState;
+    Serial.print("current state:"); Serial.println(currentState);
+    Serial.print("bOpen:"); Serial.print(bOpen); Serial.print("; bClose:"); Serial.println(bClose);
+    Serial.print("bStopNow:"); Serial.print(bStopNow); Serial.print("; bOpening:"); Serial.print(bOpening); Serial.print("; bClosing:"); Serial.println(bClosing); Serial.println("");
+  }
+
+  // set flag for state machines
+  if (bOpen && !bStopNow && !bOpening && !bClosing) {
+    bOpening = true;  // flag to start opening process
+    nextState = INIT_OPEN;
+    newState = STATE_OPEN;
+  }
+  else if (bClose && !bStopNow && !bClosing && !bOpening) {
+    bClosing = true;  // flag to start closing process
+    nextState = INIT_CLOSE;
+    newState = STATE_CLOSE;
+  }
+
+  // state machines
+  if (!bStopNow ) { // until a stop condition appears
+    if (bOpening) {
+      nextState = fsmOpen(nextState);
+      if (nextState == END_OPEN) {
+        StopGates();  // stop
+        bOpening = false;  // end of opening process state machine
+        newState = STATE_STOP2;
+        SendMessage("End of opening process.");
+      }
+    }
+    else if (bClosing) {
+      nextState = fsmClose(nextState);
+      if (nextState == END_CLOSE) {
+        StopGates();  // stop
+        bClosing = false;  // end of opening process state machine
+        newState = STATE_STOP1;
+        SendMessage("End of closing process.");
+      }
+    }
+  }
+  else {
+    StopGates();
+  }
+
+  if (bStopNow) { // press "open" or "close" button to release the "stop" state
+    StopGates();
+    bStopNow = false;
+    bOpening = false;
+    bClosing = false;
+    if (currentState == STATE_OPEN) {
+      newState = STATE_STOP2;
+    }
+    else if (currentState == STATE_CLOSE) {
+      newState = STATE_STOP1;
+    }
+    else {
+      newState = currentState;
+    }
+    SendMessage("StopEvent");
+    Serial.print("Stop count: "); Serial.println(StopCount); Serial.println("");
+  }
+}
+
+void StopGates() {
+  // stop the gates
+  digitalWrite(CLOSE_MASTER_GATE, HIGH);
+  digitalWrite(OPEN_MASTER_GATE, HIGH);
+  digitalWrite(CLOSE_SLAVE_GATE, HIGH);
+  digitalWrite(OPEN_SLAVE_GATE, HIGH);
+  isM1Stopped = true;
+  isM2Stopped = true;
+
+  SendMessage("stop");
+}
+
+void StopGateM1() {
+  // stop the gate M1
+  digitalWrite(CLOSE_MASTER_GATE, HIGH);
+  digitalWrite(OPEN_MASTER_GATE, HIGH);
+  isM1Stopped = true;
+  SendMessage("stop M1");
+}
+
+void StopGateM2() {
+  // stop the gate M2
+  digitalWrite(CLOSE_SLAVE_GATE, HIGH);
+  digitalWrite(OPEN_SLAVE_GATE, HIGH);
+  isM2Stopped = true;
+  SendMessage("stop M2");
+}
+
+void OpenGateM1() {
+  // open gate motor M1
+  digitalWrite(CLOSE_MASTER_GATE, HIGH);
+  digitalWrite(OPEN_MASTER_GATE, LOW);
+  isM1Stopped = false;
+  SendMessage("opening 1st gate...");
+}
+
+void OpenGateM2() {
+  // open gate motor M2s
+  digitalWrite(CLOSE_SLAVE_GATE, HIGH);
+  digitalWrite(OPEN_SLAVE_GATE, LOW);
+  isM2Stopped = false;
+  SendMessage("opening 2nd gate...");
+}
+
+void CloseGateM1() {
+  // close gate motor M1
+  digitalWrite(CLOSE_MASTER_GATE, LOW);
+  digitalWrite(OPEN_MASTER_GATE, HIGH);
+  isM1Stopped = false;
+  SendMessage("closing 1st gate...");
+}
+
+void CloseGateM2() {
+  // close gate motor M2
+  digitalWrite(CLOSE_SLAVE_GATE, LOW);
+  digitalWrite(OPEN_SLAVE_GATE, HIGH);
+  isM2Stopped = false;
+  SendMessage("closing 2nd gate...");
+}
+
+void SendMessage(char *Message) {
+  Serial.println(Message);
+}
+
+void StopEvent() {
+  StopCount++;
+  bStopNow = true;  // memorize "stop" button
+}
+
+void RemoteEvent() {
+  switch (currentState) {
+    case STATE_STOP1: newState = STATE_OPEN;  break;  // from stop to open
+    case STATE_OPEN: if ((bOpening) && (!bStopNow)) {
+        buttonPressedOpen = millis(); newState = STATE_STOP3;
+      } else {
+        newState = STATE_STOP2;
+      } break;  // from open to stop
+
+    case STATE_STOP3: newState = STATE_OPEN; break;
+    case STATE_STOP2: newState = STATE_CLOSE; break;  // from stop to close
+    case STATE_CLOSE: if ((bClosing) && (!bStopNow)) {
+        buttonPressedClose = millis();
+        newState = STATE_STOP4;
+      } else {
+        newState = STATE_STOP1;
+      } break;  // from open to stop
+    case STATE_STOP4: newState = STATE_CLOSE; break;
+    default: newState = STATE_STOP1;
+  }
+  //  SendMessage("Remote Control event.\r\n");
+}
+
+void Photo_Stop_Event() {
+  switch (currentState) {
+    case STATE_STOP1: newState = currentState;  break;  // from stop to open
+    case STATE_OPEN: if ((bOpening) && (!bStopNow)) {
+        buttonPressedOpen = millis(); newState = STATE_STOP3;
+      } else {
+        newState = STATE_STOP2;
+      } break;  // from open to stop
+
+    case STATE_STOP3: newState = currentState; break;
+    case STATE_STOP2: newState = currentState; break;  // from stop to close
+    case STATE_CLOSE: if ((bClosing) && (!bStopNow)) {
+        buttonPressedClose = millis();
+        newState = STATE_STOP4;
+      } else {
+        newState = STATE_STOP1;
+      } break;  // from open to stop
+    case STATE_STOP4: newState = currentState; break;
+    default: newState = STATE_STOP1;
+  }
+  //  SendMessage("Remote Control event.\r\n");
+}
+
+unsigned char fsmOpen(unsigned char state) {
+  unsigned char returnState = END_OPEN;  // default
+
+  // stop if needed:
+  if (state == END_OPEN) {
+    StopGates();
+    return END_OPEN;  // exit fsm
+  }
+
+  switch (state) {
+
+    case INIT_OPEN:
+      SendMessage("Start Opening process...");
+      timeStartOpenM1 = 0;
+      timeStartOpenM2 = 0;
+      lastTimeCheck = millis();
+      returnState = OPEN_M1;  // next state
+      break;
+
+    case OPEN_M1:
+      timeStartOpenM1 = millis();  // memorize date for opening M1
+      OpenGateM1();  // open first gate
+      returnState = OPEN_DELAY;  // next state
+      break;
+
+    case OPEN_DELAY:
+      if ( (millis() - timeStartOpenM1) >=  DELAY_OPEN ) {
+        returnState = OPEN_M2;  // next state
+      }
+      else {
+        returnState = OPEN_DELAY;  // stay in delay
+      }
+      break;
+
+    case OPEN_M2:
+      OpenGateM2();
+      timeStartOpenM2 = millis();  // memorize date for opening M2
+      returnState = OPEN_OPEN_DELAY;
+      break;
+
+    case OPEN_OPEN_DELAY:
+      if ( (millis() - timeStartOpenM1) >=  TRAVELING_DELAY_MASTER ) {
+
+        returnState = WAIT_OPEN_END;  // next state
+        StopGateM1();
+      }
+      else {
+        returnState = OPEN_OPEN_DELAY;  // stay in delay
+      }
+      break;
+
+    case WAIT_OPEN_END:
+      if ( (millis() - timeStartOpenM1) >=  TRAVELING_TIME_MASTER ) { // time elapsed since M1 start
+        returnState = END_OPEN;  // next state
+      }
+      else {
+        if (isM1Stopped && isM2Stopped) { // both motors are stopped, np need to wait more
+          returnState = END_OPEN;  // next state
+        }
+        else {
+          returnState = WAIT_OPEN_END;  // stay in delay
+        }
+      }
+      break;
+
+    case END_OPEN:
+      StopGates();
+      returnState = END_OPEN;
+      break;
+
+    default:
+      StopGates();  // stop when default
+      returnState = END_OPEN;
+  }
+
+  if ( (millis() - lastTimeCheck) >= 1000 )
+  {
+    lastTimeCheck = millis();
+
+
+  }
+
+  return returnState;
+}
+
+unsigned char fsmClose(unsigned char state) {
+  unsigned char returnState = END_CLOSE;
+
+  // stop if needed:
+  if (state == END_CLOSE) {
+    StopGates();
+    return END_CLOSE;  // exit fsm
+  }
+
+  switch (state) {
+
+    case INIT_CLOSE:
+      SendMessage("Start Closing process...");
+      timeStartCloseM2 = 0;
+      lastTimeCheck = millis();
+
+      returnState = CLOSE_M2;  // next state
+      break;
+
+    case CLOSE_M2:
+      timeStartCloseM2 = millis();  // memorize date for closing M2
+      CloseGateM2();  // close first gate
+      returnState = CLOSE_DELAY;  // next state
+      break;
+
+    case CLOSE_DELAY:
+      if ( (millis() - timeStartCloseM2) >=  DELAY_CLOSE ) { // TODO: -3000 for debug: erase it quickly!
+        returnState = CLOSE_M1;  // next state
+      }
+      else {
+        returnState = CLOSE_DELAY;  // stay in delay
+      }
+      break;
+
+    case CLOSE_M1:
+      CloseGateM1();
+      returnState = CLOSE_CLOSE_DELAY;
+      break;
+
+    case CLOSE_CLOSE_DELAY:
+      if ( (millis() - timeStartCloseM2) >=  TRAVELING_DELAY_SLAVE ) {
+
+        returnState = WAIT_CLOSE_END;  // next state
+        StopGateM2();
+      }
+      else {
+        returnState = CLOSE_CLOSE_DELAY;  // stay in delay
+      }
+      break;
+
+    case WAIT_CLOSE_END:
+      if ( (millis() - timeStartCloseM2) >=  TRAVELING_TIME_SLAVE ) {
+        returnState = END_CLOSE;  // next state
+      }
+      else {
+        if (isM1Stopped && isM2Stopped) {
+          return END_CLOSE;
+        }
+        else {
+          returnState = WAIT_CLOSE_END;  // stay in delay
+        }
+      }
+      break;
+
+    case END_CLOSE:
+      StopGates();
+      returnState = END_CLOSE;
+      break;
+
+    default:
+      StopGates();  // stop when default
+      returnState = END_CLOSE;
+  }
+
+  if ( (millis() - lastTimeCheck) >= 1000 )
+  {
+    lastTimeCheck = millis();
+
+
+  }
+
+  return returnState;
+}
+
